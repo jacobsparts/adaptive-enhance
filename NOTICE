@@ -1,0 +1,8 @@
+adaptive-enhance is a standalone Rust port of adaptiveImageEnhancement from
+OpenCE by Zhenqiang Ying:
+
+  https://github.com/baidut/OpenCE
+  https://baidut.github.io/OpenCE/caip2017.html
+
+OpenCE is distributed under the MIT License. This port reimplements the
+algorithm and the relevant OpenCV behavior without depending on OpenCV.

@@ -1,0 +1,21 @@
+[package]
+name = "adaptive-enhance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "OpenCV-compatible adaptive contrast enhancement for low-light images"
+license = "MIT"
+repository = "https://github.com/jacobsparts/adaptive-enhance"
+homepage = "https://github.com/jacobsparts/adaptive-enhance"
+readme = "README.md"
+keywords = ["image-processing", "contrast", "low-light", "png"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[dependencies]
+png = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
