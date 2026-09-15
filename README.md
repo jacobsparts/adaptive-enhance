@@ -1,16 +1,19 @@
 # adaptive-enhance
 
-A small, standalone Rust implementation of a low-light image contrast
-enhancement, with no OpenCV or Python runtime dependency. It provides a
-Unix-friendly command that reads PNG data from standard input and writes PNG
-data to standard output, and a Rust library for enhancing decoded RGB buffers or
-in-memory PNG data.
+A small, standalone Rust toolset for correcting badly exposed photographs,
+with no OpenCV or Python runtime dependency. It provides Unix-friendly commands
+that read PNG data from standard input and write PNG data to standard output,
+and a Rust library for enhancing decoded RGB buffers or in-memory PNG data.
 
-The enhancement is the adaptive illumination estimate described below, and it
-can be used on its own or as the first stage of the exposure fusion framework,
-which synthesises a brighter exposure and decides per pixel how much of it to
-use. The fusion's blend is a highlight map that keeps the tone of the
-synthesised exposure above the point a clamped mix would flatten.
+Two binaries are built:
+
+- **`adaptive-enhance`** - for **underexposed** images. It estimates the
+  illumination, synthesises a brighter exposure and decides per pixel how much
+  of it to use. Its blend is a highlight map that keeps the tone of the
+  synthesised exposure above the point a clamped mix would flatten.
+- **`iagcwd`** - for **overexposed** images. It corrects the intensity with the
+  weighted histogram of an improved adaptive gamma curve, pulling an over-bright
+  frame down while leaving hue and saturation alone.
 
 ![Before and after comparison](assets/comparison.jpg)
 
@@ -23,7 +26,7 @@ git clone https://github.com/jacobsparts/adaptive-enhance.git
 cd adaptive-enhance
 cargo build --release
 
-# Exposure fusion (the default)
+# Exposure fusion (the default), for underexposed images
 ./target/release/adaptive-enhance < input.png > enhanced.png
 
 # The plain adaptive enhancement, without any fusion
@@ -34,6 +37,9 @@ cargo build --release
 
 # Report illumination statistics and the exposure ratio
 ./target/release/adaptive-enhance --stats < input.png > enhanced.png
+
+# Gamma correction for overexposed images
+./target/release/iagcwd < input.png > corrected.png
 ```
 
 The command is pipe-oriented, so it composes with other programs:
@@ -188,9 +194,38 @@ defined in terms of the first and the second has no whole-frame effect.
 | `0.20` | light subject in photobox | compresses earlier to protect highlights and preserve detail on pale objects |
 | `0.95` | dark subject in photobox | lifts background toward white while retaining dark subject texture |
 
+## iagcwd (for over-bright images)
+
+The companion binary corrects a brightness-distorted image by measuring its mean
+intensity against an expected average, choosing a path, and applying the inverse
+CDF of a weighting distribution as a gamma curve (Cao et al., *Contrast
+enhancement of brightness-distorted images by improved adaptive gamma
+correction*, 2018). A dimmed image lifts, a bright one pulls down, and one
+already near the average is copied through. On colour images only the value
+channel changes, so hue and saturation survive.
+
+```console
+./target/release/iagcwd < overexposed.png > corrected.png
+./target/release/iagcwd --stats < overexposed.png > corrected.png
+```
+
+| option | meaning |
+| --- | --- |
+| `--dim-alpha <value>` | weighting exponent of the dimmed path (default `0.75`; lower is stronger) |
+| `--bright-alpha <value>` | weighting exponent of the bright path (default `0.25`) |
+| `--target <value>` | expected average intensity (default `112`) |
+| `--tau-t <value>` | relative deviation marking an image dimmed or bright (default `0.3`) |
+| `--tau <value>` | inverse-CDF floor of the bright path (default `0.5`) |
+| `--mode <mode>` | force a path: `dimmed`, `bright` or `none` |
+| `--stats` | decision and correction statistics, on stderr |
+
+The library entry points are `adaptive_enhance_fusion::iagcwd` (the algorithm)
+and `adaptive_enhance_fusion::gray_png` (PNG I/O that keeps greyscale
+greyscale).
+
 ## Limitations
 
-- PNG is the only encoded image format supported by the command.
+- PNG is the only encoded image format supported by the commands.
 - The knee is the only strength-like control; the highlight map's feather has no
   knob by design.
 - A perfectly flat image yields an all-zero illumination map, because the
@@ -211,5 +246,7 @@ MIT, see [LICENSE](LICENSE).
   from the OpenCE project (MIT), which the adaptive enhancement implements.
 - Ying et al., *A New Image Contrast Enhancement Algorithm using Exposure
   Fusion Framework*, CAIP 2017, which the exposure fusion framework follows.
+- Cao et al., *Contrast Enhancement of Brightness-Distorted Images by Improved
+  Adaptive Gamma Correction*, 2018, which `iagcwd` implements.
 
 See [NOTICE](NOTICE) for the original copyright notices.

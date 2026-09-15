@@ -36,6 +36,8 @@
 
 pub mod blend;
 pub mod fusion;
+pub mod gray_png;
+pub mod iagcwd;
 pub mod pipeline;
 pub mod png_io;
 pub mod resize;
