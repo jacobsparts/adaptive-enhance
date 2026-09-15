@@ -1,47 +1,49 @@
 //! Adaptive image enhancement.
 //!
-//! A standalone Rust port of the C++ function `adaptiveImageEnhancement()`
-//! (see `image_enhancement.cpp`), which is built on OpenCV:
+//! A standalone Rust implementation of the following contrast enhancement:
 //!
 //! ```text
-//! BGR -> HSV_FULL, split
+//! RGB -> HSV_FULL, split
 //! V_g  = mean of three vertical 5x1 Gaussian blurs of V (sigma 15, 80, 250)
 //! V1   = (255 + k1) * V / (max(V, V_g) + k1)     k1 = 0.1 * mean(S)
 //! V2   = (255 + k2) * V / (max(V, V_g) + k2)     k2 =      mean(S)
 //! F    = w1 * V1 + w2 * V2   (w from the principal eigenvector of the 2x2
 //!                             covariance of (V1, V2) over all pixels)
-//! HSV_FULL -> BGR with V replaced by round(F)
+//! HSV_FULL -> RGB with V replaced by round(F)
 //! ```
 //!
-//! Everything is reimplemented here from scratch (no OpenCV dependency), using
-//! the same arithmetic OpenCV uses so that results match the original:
+//! The arithmetic follows OpenCV, which the reference implementation is built
+//! on: the 8-bit `RGB2HSV_FULL` conversion uses OpenCV's fixed-point integer
+//! tables, the 8-bit `HSV2RGB_FULL` conversion its `f32` path with
+//! round-half-to-even, and the blurs, ratios and covariance are computed in
+//! `f64`. The eigenvector of the 2x2 covariance is computed in closed form
+//! rather than by `cv::eigen`; `w1` is invariant under the sign of the
+//! eigenvector, and the closed form agrees with `cv::eigen` to ~1e-11 in `f64`,
+//! far below the 1/255 quantisation step of `F`.
 //!
-//! * the 8-bit `BGR2HSV_FULL` conversion uses OpenCV's fixed-point integer
-//!   arithmetic (`hsv_shift = 12` lookup tables, full hue range 0..=255);
-//! * the 8-bit `HSV2BGR_FULL` conversion uses OpenCV's float path with
-//!   `hscale = 6.0f / 255.0f` (full-range hue) and `cvRound`
-//!   (round-half-to-even) when converting back to 8-bit;
-//! * the Gaussian filtering, the per-pixel ratios and the covariance are done
-//!   in `f64`, exactly like the `CV_64F` matrices of the C++ code.
+//! # Exposure fusion
 //!
-//! The two 8-bit HSV conversions are ports of the OpenCV kernels and reproduce
-//! `cv::cvtColor` (see `tests/opencv_compat.rs`). The only numerical freedom
-//! left is the eigenvector of the 2x2 covariance matrix, which is computed in
-//! closed form instead of by `cv::eigen`: `w1` is eigenvector-sign invariant
-//! and the closed form agrees with `cv::eigen` to ~1e-11 in `f64`, i.e. far
-//! below the 1/255 quantization step of `F`.
+//! The crate also implements the exposure fusion framework around that
+//! enhancement (CAIP 2017). The adaptive enhancement is the illumination
+//! estimator, used on its own or as the first stage of the fusion:
 //!
-//! One caveat: for HSV triples whose final `cvRound` lands exactly on a `x.5`
-//! tie, OpenCV's own `float32` arithmetic decides the last bit, so such pixels
-//! can differ from `cv::cvtColor` by one 8-bit step. Measured rate: 5 pixels
-//! out of 1.5 million random triples. See `tests/opencv_compat.rs`.
+//! * [`fusion`] - the camera response model, the entropy-optimal exposure
+//!   ratio, and the fusion itself;
+//! * [`blend`] - the highlight map that decides how much of the synthesised
+//!   exposure is used;
+//! * [`pipeline`] - the end-to-end entry points;
+//! * [`resize`] - the `area` and `bicubic` resampling the fusion needs.
 
+pub mod blend;
+pub mod fusion;
+pub mod pipeline;
 pub mod png_io;
+pub mod resize;
 
-/// Kernel size of the three Gaussian blurs (C++: `int ksize = 5;`).
-pub const KSIZE: usize = 5;
-/// Standard deviations of the three Gaussian blurs (C++: 15, 80, 250).
-pub const SIGMAS: [f64; 3] = [15.0, 80.0, 250.0];
+/// Kernel size of the three Gaussian blurs (`ksize = 5` in the original).
+const KSIZE: usize = 5;
+/// Standard deviations of the three Gaussian blurs (15, 80, 250).
+const SIGMAS: [f64; 3] = [15.0, 80.0, 250.0];
 
 /// Number of fractional bits used by OpenCV's 8-bit RGB->HSV lookup tables.
 const HSV_SHIFT: u32 = 12;
@@ -72,54 +74,89 @@ fn sdiv_table() -> [i32; 256] {
     t
 }
 
-/// `cv::cvtColor(rgb, hsv, COLOR_RGB2HSV_FULL)` for an 8-bit RGB image.
+/// The per-pixel kernel of `cv::RGB2HSV_b`, with the lookup tables passed in.
+fn rgb_pixel_to_hsv(
+    r: f64,
+    g: f64,
+    b: f64,
+    hdiv: &[i32; 256],
+    sdiv: &[i32; 256],
+    hsv: &mut [f64; 3],
+) {
+    let v = r.max(g).max(b);
+    let vmin = r.min(g).min(b);
+
+    let diff = (v - vmin) as u8 as usize;
+    let vr = if v == r { -1i32 } else { 0 };
+    let vg = if v == g { -1i32 } else { 0 };
+
+    let s = (diff as i32 * sdiv[v as usize] + (1 << (HSV_SHIFT - 1))) >> HSV_SHIFT;
+    let mut h = (vr & (g - b) as i32)
+        + (!vr
+            & ((vg & (b - r + 2.0 * diff as f64) as i32)
+                + (!vg & (r - g + 4.0 * diff as f64) as i32)));
+    h = (h * hdiv[diff] + (1 << (HSV_SHIFT - 1))) >> HSV_SHIFT;
+    h += if h < 0 { HRANGE_HSV } else { 0 };
+
+    hsv[0] = h.clamp(0, 255) as f64;
+    hsv[1] = s.clamp(0, 255) as f64;
+    hsv[2] = v;
+}
+
+/// `cv::cvtColor(rgb, hsv, COLOR_RGB2HSV_FULL)` for an interleaved RGB image,
+/// with every sample scaled on the way in.
 ///
-/// `rgb` holds `width * height * 3` interleaved bytes; the returned buffer has
-/// the same layout and holds H, S, V (H in 0..=255 for the full hue range).
-pub fn rgb_to_hsv_full(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
+/// `rgb` holds `width * height * 3` interleaved samples (any type convertible
+/// to `f64`); `scale` converts them to the `0..=255` range the conversion is
+/// defined on, which lets a caller that already holds normalised `[0, 1]`
+/// samples use them directly. The returned planes hold H (full hue range,
+/// 0..=255), S and V.
+pub(crate) fn rgb_to_hsv_full<T: Copy + Into<f64> + Sync>(
+    rgb: &[T],
+    width: usize,
+    height: usize,
+    scale: f64,
+) -> [Vec<f64>; 3] {
     assert_eq!(rgb.len(), width * height * 3, "rgb buffer size mismatch");
     let hdiv = hdiv_table();
     let sdiv = sdiv_table();
-    let mut hsv = vec![0u8; width * height * 3];
+    let mut hsv: [Vec<f64>; 3] = std::array::from_fn(|_| vec![0.0f64; width * height]);
 
-    for (src, dst) in rgb.chunks_exact(3).zip(hsv.chunks_exact_mut(3)) {
-        // Note: OpenCV's RGB2HSV_b works on (b, g, r) with blueIdx = 2 for the
-        // BGR2HSV entry point, i.e. on (r, g, b) for the RGB entry point.
-        let r = src[0] as i32;
-        let g = src[1] as i32;
-        let b = src[2] as i32;
-
-        let v = r.max(g).max(b);
-        let vmin = r.min(g).min(b);
-
-        let diff = (v - vmin) as u8 as usize;
-        let vr = if v == r { -1i32 } else { 0 };
-        let vg = if v == g { -1i32 } else { 0 };
-
-        let s = (diff as i32 * sdiv[v as usize] + (1 << (HSV_SHIFT - 1))) >> HSV_SHIFT;
-        let mut h = (vr & (g - b))
-            + (!vr & ((vg & (b - r + 2 * diff as i32)) + (!vg & (r - g + 4 * diff as i32))));
-        h = (h * hdiv[diff] + (1 << (HSV_SHIFT - 1))) >> HSV_SHIFT;
-        h += if h < 0 { HRANGE_HSV } else { 0 };
-
-        dst[0] = h.clamp(0, 255) as u8;
-        dst[1] = s.clamp(0, 255) as u8;
-        dst[2] = v as u8;
-    }
+    rgb_pixels_to_hsv(
+        |pixel, out| {
+            *out = [
+                rgb[3 * pixel].into() * scale,
+                rgb[3 * pixel + 1].into() * scale,
+                rgb[3 * pixel + 2].into() * scale,
+            ];
+        },
+        &hdiv,
+        &sdiv,
+        &mut hsv,
+    );
 
     hsv
 }
 
-/// `cvRound`: round half to even, like OpenCV's `cvRound` (SSE `cvtss2si`).
-#[inline]
-fn cv_round(x: f32) -> f32 {
-    x.round_ties_even()
-}
-
-/// `saturate_cast<uchar>` for a float that is rounded with `cvRound` first.
-#[inline]
-fn saturate_u8(x: f32) -> u8 {
-    cv_round(x).clamp(0.0, 255.0) as u8
+/// Drive the RGB->HSV kernel; `read` supplies the source triple of one pixel.
+fn rgb_pixels_to_hsv<F>(read: F, hdiv: &[i32; 256], sdiv: &[i32; 256], hsv: &mut [Vec<f64>; 3])
+where
+    F: Fn(usize, &mut [f64; 3]) + Sync,
+{
+    // Pixels are independent, and each thread writes a contiguous range of
+    // every plane, so the split cannot change a single value.
+    parallel_planes(hsv, worker_count(), |planes, start| {
+        let [h, s, v] = planes else { unreachable!() };
+        let mut src = [0.0f64; 3];
+        let mut out = [0.0f64; 3];
+        for (local, pixel) in (start..start + h.len()).enumerate() {
+            read(pixel, &mut src);
+            rgb_pixel_to_hsv(src[0], src[1], src[2], hdiv, sdiv, &mut out);
+            h[local] = out[0];
+            s[local] = out[1];
+            v[local] = out[2];
+        }
+    });
 }
 
 /// `cv::HSV2RGB_native()` for a single pixel; returns (b, g, r) in 0..=1.
@@ -158,28 +195,111 @@ fn hsv_pixel_to_rgb(h: f32, s: f32, v: f32, hscale: f32) -> (f32, f32, f32) {
     (tab[d[0]], tab[d[1]], tab[d[2]])
 }
 
-/// `cv::cvtColor(hsv, rgb, COLOR_HSV2RGB_FULL)` for an 8-bit image.
+/// `cvRound`: round half to even, like OpenCV's `cvRound` (SSE `cvtss2si`).
+#[inline]
+fn cv_round(x: f32) -> f32 {
+    x.round_ties_even()
+}
+
+/// `saturate_cast<uchar>` for a float that is rounded with `cvRound` first.
+#[inline]
+fn saturate_u8(x: f32) -> u8 {
+    cv_round(x).clamp(0.0, 255.0) as u8
+}
+
+/// Run `f` over every element of `dst`, split into contiguous chunks across
+/// threads when the slice is large enough for the hand-off to pay for itself.
 ///
-/// `hsv` holds `width * height * 3` interleaved bytes (H, S, V) and the result
-/// is an interleaved 8-bit RGB image.
-pub fn hsv_to_rgb_full(hsv: &[u8], width: usize, height: usize) -> Vec<u8> {
-    assert_eq!(hsv.len(), width * height * 3, "hsv buffer size mismatch");
-    let mut rgb = vec![0u8; width * height * 3];
+/// The slice is split into disjoint chunks, so the threads never alias and the
+/// per-element work is identical to the serial version.
+pub(crate) fn parallel_fill<T, F>(dst: &mut [T], workers: usize, f: F)
+where
+    T: Send,
+    F: Fn(&mut T, usize) + Sync,
+{
+    /// Below this many elements the thread hand-off costs more than the work.
+    const THRESHOLD: usize = 1 << 15;
+    let len = dst.len();
+    let workers = workers.min(len / THRESHOLD).max(1);
+    if workers <= 1 {
+        for (index, value) in dst.iter_mut().enumerate() {
+            f(value, index);
+        }
+        return;
+    }
+    let chunk = len.div_ceil(workers);
+    let mut offset = 0usize;
+    std::thread::scope(|scope| {
+        for slice in dst.chunks_mut(chunk) {
+            let start = offset;
+            offset += slice.len();
+            let f = &f;
+            scope.spawn(move || {
+                for (index, value) in slice.iter_mut().enumerate() {
+                    f(value, start + index);
+                }
+            });
+        }
+    });
+}
 
-    for (src, dst) in hsv.chunks_exact(3).zip(rgb.chunks_exact_mut(3)) {
-        let h = src[0] as f32;
-        let s = src[1] as f32 * (1.0f32 / 255.0);
-        let v = src[2] as f32 * (1.0f32 / 255.0);
-
-        let (b, g, r) = hsv_pixel_to_rgb(h, s, v, HSCALE);
-
-        // dst[blueIdx] = saturate_cast<uchar>(b * 255.0f); blueIdx == 2 here.
-        dst[0] = saturate_u8(r * 255.0);
-        dst[1] = saturate_u8(g * 255.0);
-        dst[2] = saturate_u8(b * 255.0);
+/// [`parallel_fill`] for a kernel that writes several planes at once.
+///
+/// `out` is split in lockstep, so each thread gets a disjoint index range of
+/// every plane and the split cannot change a value.
+pub(crate) fn parallel_planes<T, F>(out: &mut [Vec<T>], workers: usize, f: F)
+where
+    T: Send,
+    F: Fn(&mut [&mut [T]], usize) + Sync,
+{
+    /// Below this many elements the thread hand-off costs more than the work.
+    const THRESHOLD: usize = 1 << 15;
+    let n = out.first().map(|plane| plane.len()).unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let workers = workers.min(n / THRESHOLD).max(1);
+    if workers <= 1 {
+        let mut parts: Vec<&mut [T]> = out.iter_mut().map(|plane| plane.as_mut_slice()).collect();
+        f(&mut parts, 0);
+        return;
     }
 
-    rgb
+    let chunk = n.div_ceil(workers);
+    let mut offset = 0usize;
+    std::thread::scope(|scope| {
+        let mut rest: Vec<&mut [T]> = out.iter_mut().map(|plane| plane.as_mut_slice()).collect();
+        while offset < n {
+            let start = offset;
+            let len = chunk.min(n - offset);
+            let mut parts: Vec<&mut [T]> = Vec::with_capacity(rest.len());
+            let mut tail: Vec<&mut [T]> = Vec::with_capacity(rest.len());
+            for plane in rest {
+                let (head, tail_rest) = plane.split_at_mut(len);
+                parts.push(head);
+                tail.push(tail_rest);
+            }
+            rest = tail;
+            let f = &f;
+            scope.spawn(move || f(&mut parts, start));
+            offset += len;
+        }
+    });
+}
+
+/// How many threads to use: one per core, capped at 64.
+///
+/// `ADAPTIVE_ENHANCE_WORKERS` overrides it (clamped to `1..=64`).
+pub(crate) fn worker_count() -> usize {
+    if let Ok(value) = std::env::var("ADAPTIVE_ENHANCE_WORKERS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(1, 64);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(64)
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +307,7 @@ pub fn hsv_to_rgb_full(hsv: &[u8], width: usize, height: usize) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// `cv::getGaussianKernel(ksize, sigma)` (which ignores `ksize` for `sigma > 0`).
-pub fn gaussian_kernel(ksize: usize, sigma: f64) -> Vec<f64> {
+fn gaussian_kernel(ksize: usize, sigma: f64) -> Vec<f64> {
     assert!(ksize > 0 && ksize % 2 == 1, "kernel size must be odd");
     let scale2x = -0.5 / (sigma * sigma);
     let mut kernel = vec![0.0f64; ksize];
@@ -210,24 +330,51 @@ pub fn gaussian_kernel(ksize: usize, sigma: f64) -> Vec<f64> {
 /// The C++ code hands `cv::getGaussianKernel(ksize, sigma)` to `cv::filter2D`.
 /// That helper returns a `ksize x 1` *column* vector, so the kernel is 5x1 and
 /// the filtering is a purely vertical convolution (there is no horizontal pass).
-pub fn filter_vertical(src: &[u8], width: usize, height: usize, kernel: &[f64]) -> Vec<f64> {
+fn filter_vertical<T: Copy + Into<f64> + Sync>(
+    src: &[T],
+    width: usize,
+    height: usize,
+    kernel: &[f64],
+) -> Vec<f64> {
+    assert_eq!(src.len(), width * height, "source buffer size mismatch");
     let radius = kernel.len() / 2;
     let mut dst = vec![0.0f64; width * height];
 
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = 0.0f64;
-            for (i, k) in kernel.iter().enumerate() {
-                let yi = y as isize + i as isize - radius as isize;
-                if yi >= 0 && (yi as usize) < height {
-                    acc += k * src[yi as usize * width + x] as f64;
-                }
+    // One output sample: the kernel is a column vector, so only the row
+    // changes, and the neighbourhood is clipped at the image border
+    // (`BORDER_CONSTANT`).
+    let convolved = |y: usize, x: usize| {
+        let mut acc = 0.0f64;
+        for (i, k) in kernel.iter().enumerate() {
+            let yi = y as isize + i as isize - radius as isize;
+            if yi >= 0 && (yi as usize) < height {
+                acc += k * src[yi as usize * width + x].into();
             }
-            dst[y * width + x] = acc;
         }
-    }
+        acc
+    };
+
+    // Pixels are independent, so the split across threads is exact.
+    parallel_fill(&mut dst, worker_count(), |value, index| {
+        *value = convolved(index / width, index % width);
+    });
 
     dst
+}
+
+/// `(255 + k) * v / (max(v, v_g) + k)`.
+///
+/// `k` is proportional to `mean(S)`, so on a fully black or fully desaturated
+/// image the denominator can be exactly zero; the ratio is then left at zero
+/// instead of producing a NaN.
+#[inline]
+fn ratio(v: f64, v_g: f64, k: f64) -> f64 {
+    let denominator = v.max(v_g) + k;
+    if denominator == 0.0 {
+        0.0
+    } else {
+        ((255.0 + k) * v) * (1.0 / denominator)
+    }
 }
 
 /// Weight `w1` of the first principal component of the 2x2 covariance matrix
@@ -270,59 +417,117 @@ fn principal_weight(x: &[f64], y: &[f64]) -> f64 {
 /// has the same layout. An alpha channel, if the image has one, is not part of
 /// this buffer and is therefore untouched, like in the C++ original.
 pub fn adaptive_enhance_rgb(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
-    assert_eq!(rgb.len(), width * height * 3, "rgb buffer size mismatch");
     assert!(width > 0 && height > 0, "empty image");
-    let n = width * height;
+    let (planes, _) = adaptive_enhance_interleaved(rgb, width, height, 1.0);
+    let mut out = vec![0u8; width * height * 3];
+    parallel_fill(&mut out, worker_count(), |value, index| {
+        *value = planes[index % 3][index / 3];
+    });
+    out
+}
 
-    // cv::cvtColor(src, HSV, COLOR_BGR2HSV_FULL); cv::split(HSV, ...);
-    // H is only read back when the HSV image is merged again, so the split
-    // channels we actually need are S and V.
-    let hsv = rgb_to_hsv_full(rgb, width, height);
-    let mut s_channel = vec![0u8; n];
-    let mut v_channel = vec![0u8; n];
-    for i in 0..n {
-        s_channel[i] = hsv[3 * i + 1];
-        v_channel[i] = hsv[3 * i + 2];
-    }
+/// [`adaptive_enhance_rgb`] on an interleaved image of any sample type, with a
+/// scale factor applied as the samples are read.
+///
+/// `scale` converts the samples to the `0..=255` range the algorithm is defined
+/// on, so a caller holding normalised samples can use them directly. The
+/// returned value channel is `F`, the enhanced value channel the fusion uses as
+/// its illumination estimate.
+pub fn adaptive_enhance_interleaved<T: Copy + Into<f64> + Sync>(
+    rgb: &[T],
+    width: usize,
+    height: usize,
+    scale: f64,
+) -> ([Vec<u8>; 3], Vec<f64>) {
+    let hsv = rgb_to_hsv_full(rgb, width, height, scale);
+    adaptive_enhance_hsv(&hsv, width, height)
+}
+
+/// The enhancement itself, given the HSV planes of the input: three vertical
+/// blurs, the two ratios, and the principal-component weighting of them.
+fn adaptive_enhance_hsv(
+    hsv: &[Vec<f64>; 3],
+    width: usize,
+    height: usize,
+) -> ([Vec<u8>; 3], Vec<f64>) {
+    let n = width * height;
+    assert!(width > 0 && height > 0, "empty image");
+    assert_eq!(hsv[0].len(), n, "hsv buffer size mismatch");
+
+    let s_channel = &hsv[1];
+    let v_channel = &hsv[2];
 
     // Three vertical Gaussian blurs of V, averaged.
     let mut v_g = vec![0.0f64; n];
     for sigma in SIGMAS {
         let kernel = gaussian_kernel(KSIZE, sigma);
-        let blurred = filter_vertical(&v_channel, width, height, &kernel);
-        for (acc, b) in v_g.iter_mut().zip(&blurred) {
-            *acc += b / 3.0;
-        }
+        let blurred = filter_vertical(v_channel, width, height, &kernel);
+        parallel_fill(&mut v_g, worker_count(), |acc, index| {
+            *acc += blurred[index] / 3.0;
+        });
     }
 
     // cv::mean(S)
-    let avg_s = s_channel.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+    let avg_s = s_channel.iter().sum::<f64>() / n as f64;
     let k1 = 0.1 * avg_s;
     let k2 = avg_s;
 
     let mut v1 = vec![0.0f64; n];
     let mut v2 = vec![0.0f64; n];
-    for i in 0..n {
-        let v = v_channel[i] as f64;
-        let denominator1 = v.max(v_g[i]) + k1;
-        let denominator2 = v.max(v_g[i]) + k2;
-        v1[i] = ((255.0 + k1) * v) * (1.0 / denominator1);
-        v2[i] = ((255.0 + k2) * v) * (1.0 / denominator2);
-    }
+    // Both ratios are per-pixel, as is the average of the blurs, so the loops
+    // are split across threads without changing a value.
+    parallel_fill(&mut v1, worker_count(), |value, i| {
+        *value = ratio(v_channel[i], v_g[i], k1);
+    });
+    parallel_fill(&mut v2, worker_count(), |value, i| {
+        *value = ratio(v_channel[i], v_g[i], k2);
+    });
 
     // Principal component of (V1, V2) -> weights w1, w2.
     let w1 = principal_weight(&v1, &v2);
     let w2 = 1.0 - w1;
 
-    let mut out_hsv = hsv;
-    for i in 0..n {
-        let f = w1 * v1[i] + w2 * v2[i];
-        // F.convertTo(F, CV_8U) on a CV_64F matrix: cvRound (round half to
-        // even) followed by saturate_cast<uchar>. Rounding the f64 value
-        // directly matters: going through f32 first can round a value like
-        // 12.5 up to 12.5000001 and then away from the even neighbour.
-        out_hsv[3 * i + 2] = f.round_ties_even().clamp(0.0, 255.0) as u8;
-    }
+    // F is written over V1, which nothing reads afterwards.
+    let v2_ref = &v2;
+    parallel_fill(&mut v1, worker_count(), |value, i| {
+        *value = w1 * *value + w2 * v2_ref[i];
+    });
+    let f_channel = v1;
 
-    hsv_to_rgb_full(&out_hsv, width, height)
+    // HSV -> RGB straight into the output bytes: the kernel rounds once, so
+    // nothing is lost by writing its result directly.
+    let mut out: [Vec<u8>; 3] = std::array::from_fn(|_| vec![0u8; n]);
+    // The conversion is per pixel, and every thread writes its own range of the
+    // output planes, so the split is exact.
+    let h0 = &hsv[0];
+    let h1 = &hsv[1];
+    let f_channel_ref = &f_channel;
+    parallel_planes(&mut out, worker_count(), |planes, start| {
+        let [r_plane, g_plane, b_plane]: &mut [&mut [u8]; 3] = planes.try_into().unwrap();
+        for (local, ((r_out, g_out), b_out)) in r_plane
+            .iter_mut()
+            .zip(g_plane.iter_mut())
+            .zip(b_plane.iter_mut())
+            .enumerate()
+        {
+            let i = start + local;
+            // `out_hsv[3 * i + 2] = f.round_ties_even().clamp(0.0, 255.0) as u8`:
+            // F is quantised to the 0..=255 sample range *before* the HSV->RGB
+            // kernel sees it, exactly as `cv::cvtColor` does.
+            let f = f_channel_ref[i].round_ties_even().clamp(0.0, 255.0);
+            let (b, g, r) = hsv_pixel_to_rgb(
+                h0[i] as f32,
+                h1[i] as f32 * (1.0f32 / 255.0),
+                f as f32 * (1.0f32 / 255.0),
+                HSCALE,
+            );
+            // `saturate_u8(r * 255.0)` for each output channel, in the RGB
+            // order the kernel returns them.
+            *r_out = saturate_u8(r * 255.0);
+            *g_out = saturate_u8(g * 255.0);
+            *b_out = saturate_u8(b * 255.0);
+        }
+    });
+
+    (out, f_channel)
 }

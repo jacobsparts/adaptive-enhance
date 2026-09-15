@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "adaptive-enhance"
+name = "adaptive-enhance-fusion"
 version = "0.1.0"
 dependencies = [
  "png",

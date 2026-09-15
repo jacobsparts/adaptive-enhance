@@ -1,42 +1,20 @@
 # adaptive-enhance
 
-[![CI](https://github.com/jacobsparts/adaptive-enhance/actions/workflows/ci.yml/badge.svg)](https://github.com/jacobsparts/adaptive-enhance/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+A small, standalone Rust implementation of a low-light image contrast
+enhancement, with no OpenCV or Python runtime dependency. It provides a
+Unix-friendly command that reads PNG data from standard input and writes PNG
+data to standard output, and a Rust library for enhancing decoded RGB buffers or
+in-memory PNG data.
 
-A small, standalone Rust implementation of OpenCE's adaptive image enhancement
-algorithm. It brightens shadows and increases local contrast in low-light
-images without requiring OpenCV.
+The enhancement is the adaptive illumination estimate described below, and it
+can be used on its own or as the first stage of the exposure fusion framework,
+which synthesises a brighter exposure and decides per pixel how much of it to
+use. The fusion's blend is a highlight map that keeps the tone of the
+synthesised exposure above the point a clamped mix would flatten.
 
-The project provides both:
+![Before and after comparison](assets/comparison.jpg)
 
-- a Unix-friendly command that reads PNG data from standard input and writes
-  PNG data to standard output; and
-- a Rust library for enhancing decoded RGB buffers or in-memory PNG data.
-
-## Why this exists
-
-Adaptive enhancement can reveal product contours that disappear into a dark or
-flatly lit surface. That can make an otherwise unusable image detectable by a
-vision model.
-
-It is **not** a universally beneficial preprocessing step. On an already
-well-lit product photo, enhancement may amplify texture across the entire table
-or backdrop. A segmentation or localization model can then mistake much of the
-scene for foreground.
-
-For that reason, our intended product-photo pipeline uses this as a fallback:
-
-1. run the original image through the detector;
-2. if the detector returns no usable detection, enhance the original image;
-3. retry detection on the enhanced image; and
-4. retain the original image for display and downstream work unless the
-   enhanced result is specifically needed.
-
-This repository is model-agnostic. We use the strategy with
-[LocateAnything](https://research.nvidia.com/labs/lpr/locate-anything/), but the
-project is not affiliated with or endorsed by NVIDIA.
-
-## Quick start
+## Build and run
 
 A stable Rust toolchain (Rust 1.85 or newer) is required.
 
@@ -44,15 +22,34 @@ A stable Rust toolchain (Rust 1.85 or newer) is required.
 git clone https://github.com/jacobsparts/adaptive-enhance.git
 cd adaptive-enhance
 cargo build --release
+
+# Exposure fusion (the default)
 ./target/release/adaptive-enhance < input.png > enhanced.png
+
+# The plain adaptive enhancement, without any fusion
+./target/release/adaptive-enhance --adaptive < input.png > enhanced.png
+
+# A brighter, flatter highlight map (default: auto-knee)
+./target/release/adaptive-enhance -k 0.9 < input.png > enhanced.png
+
+# Report illumination statistics and the exposure ratio
+./target/release/adaptive-enhance --stats < input.png > enhanced.png
 ```
 
-The command is deliberately pipe-oriented, so it also composes with other
-programs:
+The command is pipe-oriented, so it composes with other programs:
 
 ```console
 cat input.png | adaptive-enhance > enhanced.png
 ```
+
+| option | meaning |
+| --- | --- |
+| `--fusion` | exposure fusion (default) |
+| `--adaptive` | the plain adaptive enhancement |
+| `-k`, `--knee <value>` | highlight-map knee, in `[0, 1)` (default: auto-knee) |
+| `--stats` | illumination statistics and exposure ratio, on stderr |
+| `-h`, `--help` | usage |
+| `-V`, `--version` | version |
 
 Errors are written to stderr and result in a non-zero exit status. No partial
 PNG is written when processing fails.
@@ -66,100 +63,153 @@ PNG is written when processing fails.
 
 Output is always 8-bit RGB or RGBA. Alpha is preserved unchanged. For 16-bit
 input, each sample is reduced to its most significant byte before enhancement.
+EXIF and other source metadata are not preserved.
 
 ## Library use
 
 Enhance an interleaved 8-bit RGB buffer:
 
 ```rust
-let enhanced = adaptive_enhance::adaptive_enhance_rgb(&rgb, width, height);
+let enhanced = adaptive_enhance_fusion::adaptive_enhance_rgb(&rgb, width, height);
 ```
 
-The input must contain exactly `width * height * 3` bytes in RGB order. The
+The input must contain exactly `width * height * 3` bytes in RGB order; the
 returned buffer has the same layout and dimensions.
 
 Or process a complete PNG in memory:
 
 ```rust
-let output_png = adaptive_enhance::png_io::enhance_png(&input_png)?;
+let output_png = adaptive_enhance_fusion::png_io::enhance_png(&input_png)?;
 ```
 
-The PNG helpers return `Result<_, String>`. The lower-level RGB function asserts
-that its dimensions and buffer length are valid.
+The exposure fusion framework (crate `adaptive-enhance-fusion`):
 
-## Algorithm
+```rust
+use adaptive_enhance_fusion::pipeline::{enhance_rgb, PipelineParams};
 
-The implementation ports `adaptiveImageEnhancement()` from the
-[OpenCE project](https://baidut.github.io/OpenCE/caip2017.html):
+let params = PipelineParams::default();      // fusion.knee = 0.75
+let output = enhance_rgb(&params, &rgb, width, height);
+// output.rgb              fused 8-bit RGB
+// output.illumination     the relative illumination map (f64, [0, 1])
+// output.exposure_ratio   the k chosen by the entropy maximisation
+```
+
+The knee is a field of `FusionParams` (`params.fusion.knee`), defaulting to
+`None` (auto-knee). When set to `Some(k)`, `k` is used directly without adjustment.
+
+The PNG helpers return `Result<_, String>`. The lower-level RGB functions
+assert that their dimensions and buffer length are valid.
+
+## The enhancement
 
 1. convert RGB to full-range HSV;
 2. vertically filter the value channel with three 5x1 Gaussian kernels
    (`sigma = 15, 80, 250`) and average the results;
-3. derive two candidate value channels using the mean saturation;
-4. blend those candidates using the principal eigenvector of their 2x2
-   covariance matrix; and
+3. derive two candidate value channels from the mean saturation;
+4. blend the candidates using the principal eigenvector of their 2x2 covariance
+   matrix; and
 5. replace the value channel and convert back to RGB.
 
-Only luminance/value is adapted; hue and saturation are retained through the
-HSV round trip.
+Only luminance/value is adapted; hue and saturation are retained through the HSV
+round trip. The arithmetic follows OpenCV, which the reference implementation is
+built on: the 8-bit RGB to HSV conversion is OpenCV's fixed-point integer path,
+the HSV to RGB conversion its `f32` path with round-half-to-even, and the blurs,
+ratios and covariance are computed in `f64` (see `src/lib.rs`).
 
-### OpenCV compatibility
+## Exposure fusion
 
-The original implementation relies on details of OpenCV that differ from naive
-textbook formulas. This port reproduces those details without linking OpenCV,
-including:
+1. normalise the image to `[0, 1]`;
+2. estimate a relative illumination map `t` - the adaptive enhancement above,
+   whose enhanced value channel is normalised and returned as that map;
+3. synthesise an exposure `J = applyK(I, k*) - 0.01`, where
+   `applyK(I, k) = I^(k^a) * exp((1 - k^a) * b)` with `a = -0.3293`,
+   `b = 1.1258`, and `k*` maximises the entropy of `J` restricted to the
+   under-exposed pixels `t < 0.5` (a golden-section search over `k` in `[1, 7]`);
+4. decide, per pixel, how much of `J` to use - `W = 1 - t`, so a sample the
+   estimator calls well lit is replaced by the synthesised exposure and a dark
+   one keeps the original.
 
-- OpenCV's fixed-point 8-bit `RGB2HSV_FULL` path;
-- its floating-point `HSV2RGB_FULL` path and round-half-to-even behavior;
-- the original vertical-only Gaussian filtering with zero padding;
-- unnormalized covariance sums; and
-- round-half-to-even conversion of the final value channel.
+The entropy is computed on the `clip(value * 255) as u8` histogram, the `k`
+search runs on a 50x50 `area`-resized copy of the normalised image with the
+under-exposure mask `bicubic`-resized to the same size and thresholded at 0.5,
+and the fused value is quantised by truncation of `clamp(value * 255, 0, 255)`.
 
-Tests compare conversion kernels and complete PNG outputs against reference
-values generated with OpenCV 4.10. In rare HSV-to-RGB half-way cases, OpenCV's
-internal `float32` rounding can differ by one 8-bit step. The known cases are
-documented in `tests/opencv_compat.rs`.
+### The highlight map
 
-## Validation and development
+The synthesised exposure is not confined to `[0, 1]`: with the camera response
+above, the sample at `I = 1` lands at `J = 1.58 .. 1.69` for every exposure
+ratio the entropy search chooses, so the brightest part of a photograph carries
+its tone in `J`'s out-of-range slope. Any blend that clamps `J` to the output
+range flattens that band. `src/blend.rs` maps `J` instead, in four per-pixel
+steps:
 
-The test suite has no Python or OpenCV runtime dependency:
+1. **Polarity.** `W = 1 - t`, so the output is `I * (1 - t) + mapped * t`.
+2. **A tone map that does not clip.** `J`'s luminance is the identity below a
+   knee and above it the straight line from `(knee, knee)` to
+   `(J_max, CEILING)`, where `CEILING = 249/255` - four places below white, so
+   the clipped and the merely bright stay distinguishable. Below the knee the
+   rule is exactly the plain polarised mix.
+3. **Colour above the knee.** Compressing luminance alone would raise chroma, so
+   the channels are rebuilt around the mapped luminance,
+   `mapped_c = g(L) + s * (J_c - L)`, with `s = min(room, cap)` bounded by the
+   ceiling (`room`) and by the input's own chroma (`cap`), and `1.0` below the
+   knee.
+4. **The feather.** The `cap` term is a condition, so it is ramped in over a
+   fraction of the headroom `J_max - knee` with a smoothstep on the argument.
+   The join at the knee is C1 and the map, a `min` of two continuous functions,
+   has no seam.
 
-```console
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-```
+The knee is the one exposed parameter: the point where the map stops being the
+identity, traded almost linearly against frame brightness.
 
-The checked-in golden fixtures were generated with OpenCV 4.10
-(`opencv-python-headless==4.10.0.84`). CI runs formatting, linting, and tests on
-every push and pull request.
+To automatically adapt across both underexposed scenes (preventing overcast
+skies from blowing out) and specular photobox scenes (preventing pale/metallic
+surfaces from blooming), the effective knee is scaled by the scene's **diffuse
+highlight ceiling** (the 98.5th percentile of RGB):
+`effective_knee = knee * (diffuse_ceiling / 255)^2`.
 
-## Repository layout
+- For natural scenes with full highlights, the diffuse ceiling is near 255, so
+  the effective knee remains at `~0.77 - 0.80`.
+- For underexposed scenes without true highlights, the knee automatically drops
+  (e.g. `~0.13` on `homes`), preserving shadow richness and overcast sky tone.
+- For pale objects in a photobox with specular sparks, the diffuse ceiling
+  anchors to the object's body rather than the isolated glints, dropping the
+  knee to `~0.26` to keep specular highlights crisp and unbloomed.
 
-```text
-src/lib.rs             enhancement algorithm and color conversions
-src/png_io.rs          PNG decoding, encoding, and in-memory pipeline
-src/main.rs            stdin-to-stdout command-line interface
-tests/opencv_compat.rs OpenCV compatibility checks
-tests/pipeline.rs      end-to-end CLI and fixture tests
-tests/fixtures/        source images and OpenCV reference outputs
-```
+`CEILING` and the feather fraction are fixed, because the map's statistics are
+defined in terms of the first and the second has no whole-frame effect.
+
+### Recommended knee values
+
+| knee | use case | description |
+| --- | --- | --- |
+| auto | general photos (default) | automatically adapts to scene dynamic range and diffuse highlights |
+| `0.75` | fixed natural knee | balanced contrast and brightness for natural scenes |
+| `0.20` | light subject in photobox | compresses earlier to protect highlights and preserve detail on pale objects |
+| `0.95` | dark subject in photobox | lifts background toward white while retaining dark subject texture |
 
 ## Limitations
 
-- PNG is the only encoded image format supported by the CLI.
-- The algorithm is intentionally fixed to the original parameters; there are
-  no strength or threshold controls.
-- Enhancement is global and may make background texture more salient. Evaluate
-  the output against your own detector and dataset rather than applying it
-  unconditionally.
-- EXIF and other source-image metadata are not preserved when the PNG is
-  re-encoded.
+- PNG is the only encoded image format supported by the command.
+- The knee is the only strength-like control; the highlight map's feather has no
+  knob by design.
+- A perfectly flat image yields an all-zero illumination map, because the
+  estimator normalises by the input's range.
+- On a constant objective the exposure ratio search returns the end of its
+  interval (`k = 7`); an output that looks unchanged may simply mean almost
+  nothing was classified as under-exposed. `--stats` reports both.
+- Enhancement is global and may make background texture more salient; evaluate
+  the output against your own use case rather than applying it unconditionally.
 
-## Attribution and license
+## License
 
-This is an independent Rust port of work from
-[OpenCE](https://github.com/baidut/OpenCE), originally copyright Zhenqiang Ying
-and released under the MIT License. See [NOTICE](NOTICE) for attribution.
+MIT, see [LICENSE](LICENSE).
 
-This repository is also released under the [MIT License](LICENSE).
+## Inspiration
+
+- [`adaptiveImageEnhancement()`](https://baidut.github.io/OpenCE/caip2017.html)
+  from the OpenCE project (MIT), which the adaptive enhancement implements.
+- Ying et al., *A New Image Contrast Enhancement Algorithm using Exposure
+  Fusion Framework*, CAIP 2017, which the exposure fusion framework follows.
+
+See [NOTICE](NOTICE) for the original copyright notices.

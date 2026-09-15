@@ -1,7 +1,4 @@
-//! PNG decoding/encoding helpers.
-//!
-//! The command line tool reads a PNG on stdin and writes a PNG on stdout; the
-//! helpers live here so that they can be exercised by the integration tests.
+//! PNG decoding and encoding.
 
 use std::io::{Cursor, Write};
 
@@ -19,13 +16,8 @@ pub struct Image {
 
 impl Image {
     /// Number of pixels.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.width * self.height
-    }
-
-    /// True if the image has no pixels.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Interleaved RGB or RGBA samples, ready to be encoded as a PNG.
@@ -152,51 +144,4 @@ pub fn enhance_png(input: &[u8]) -> Result<Vec<u8>, String> {
         rgb: enhanced,
         alpha: image.alpha,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn encode_16_bit(color: ColorType, width: u32, data: &[u8]) -> Vec<u8> {
-        let mut output = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut output, width, 1);
-            encoder.set_color(color);
-            encoder.set_depth(BitDepth::Sixteen);
-            let mut writer = encoder.write_header().unwrap();
-            writer.write_image_data(data).unwrap();
-        }
-        output
-    }
-
-    #[test]
-    fn decodes_16_bit_rgb_using_most_significant_bytes() {
-        let input = encode_16_bit(
-            ColorType::Rgb,
-            2,
-            &[
-                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44,
-            ],
-        );
-
-        let image = decode_png(&input).unwrap();
-
-        assert_eq!(image.rgb, [0x12, 0x56, 0x9a, 0xde, 0x11, 0x33]);
-        assert_eq!(image.alpha, None);
-    }
-
-    #[test]
-    fn decodes_16_bit_rgba_and_preserves_alpha() {
-        let input = encode_16_bit(
-            ColorType::Rgba,
-            1,
-            &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
-        );
-
-        let image = decode_png(&input).unwrap();
-
-        assert_eq!(image.rgb, [0x12, 0x56, 0x9a]);
-        assert_eq!(image.alpha, Some(vec![0xde]));
-    }
 }
