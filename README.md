@@ -5,6 +5,14 @@ with no OpenCV or Python runtime dependency. It provides Unix-friendly commands
 that read PNG data from standard input and write PNG data to standard output,
 and a Rust library for enhancing decoded RGB buffers or in-memory PNG data.
 
+The sibling [lightgpu inference engines](https://github.com/jacobsparts/lightgpu) -
+[realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
+[rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
+[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
+[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) - share the
+[lightgpu](https://github.com/jacobsparts/lightgpu) CUDA toolkit. This toolset is
+CPU-only and does not use it.
+
 Three binaries are built:
 
 - **`adaptive-enhance`** - for **underexposed** images. It estimates the
