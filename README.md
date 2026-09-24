@@ -12,6 +12,8 @@ The sibling [lightgpu inference engines](https://github.com/jacobsparts/lightgpu
 [lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) - share the
 [lightgpu](https://github.com/jacobsparts/lightgpu) CUDA toolkit. This toolset is
 CPU-only and does not use it.
+[pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
+cleaning up product photos that drives this toolset and all four engines.
 
 Three binaries are built:
 
