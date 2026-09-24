@@ -41,6 +41,7 @@ pub mod iagcwd;
 pub mod pipeline;
 pub mod png_io;
 pub mod resize;
+pub mod white_balance;
 
 /// Kernel size of the three Gaussian blurs (`ksize = 5` in the original).
 const KSIZE: usize = 5;

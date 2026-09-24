@@ -5,7 +5,7 @@ with no OpenCV or Python runtime dependency. It provides Unix-friendly commands
 that read PNG data from standard input and write PNG data to standard output,
 and a Rust library for enhancing decoded RGB buffers or in-memory PNG data.
 
-Two binaries are built:
+Three binaries are built:
 
 - **`adaptive-enhance`** - for **underexposed** images. It estimates the
   illumination, synthesises a brighter exposure and decides per pixel how much
@@ -14,6 +14,10 @@ Two binaries are built:
 - **`iagcwd`** - for **overexposed** images. It corrects the intensity with the
   weighted histogram of an improved adaptive gamma curve, pulling an over-bright
   frame down while leaving hue and saturation alone.
+- **`white-balance`** - for **mis-set white balance**. It measures the cast from
+  the background of a photograph shot on a white sweep and scales each channel
+  so that background becomes white, with an optional soft knee that keeps
+  highlights from clipping.
 
 ![Before and after comparison](assets/comparison.jpg)
 
@@ -40,6 +44,12 @@ cargo build --release
 
 # Gamma correction for overexposed images
 ./target/release/iagcwd < input.png > corrected.png
+
+# White balance from the background of a product photo
+./target/release/white-balance < input.png > balanced.png
+
+# The same, keeping specular highlights from clipping
+./target/release/white-balance --safe < input.png > balanced.png
 ```
 
 The command is pipe-oriented, so it composes with other programs:
@@ -222,6 +232,47 @@ channel changes, so hue and saturation survive.
 The library entry points are `adaptive_enhance_fusion::iagcwd` (the algorithm)
 and `adaptive_enhance_fusion::gray_png` (PNG I/O that keeps greyscale
 greyscale).
+
+## white-balance (for mis-set white balance)
+
+A product photo on a white sweep is supposed to have a neutral white
+background, but the camera and the light leave a cast in it, and every colour in
+the frame inherits that cast. `white-balance` measures the cast from the
+background and removes it by scaling each channel so that background's white
+lands on 255.
+
+The white point is measured from the **outer edge** of the image, where the
+background is: the border strip is 5% of the shorter side, the brightest 1% of
+those pixels by their largest channel is taken as the reference, and the
+per-channel means of that reference are the white point. Reading only the border
+keeps the subject out of the estimate; reading only the brightest 1% keeps a
+shadow on the sweep out of it too.
+
+```console
+./target/release/white-balance < cast.png > neutral.png
+./target/release/white-balance --safe < cast.png > neutral.png
+./target/release/white-balance --stats < cast.png > neutral.png
+```
+
+| option | meaning |
+| --- | --- |
+| `-s`, `--safe` | roll the highlights into 255 instead of clipping them |
+| `-k`, `--knee <value>` | point on the normalised range where `--safe` starts to roll off (default `0.5`) |
+| `--stats` | measured white point, per-channel gains and clipped fraction, on stderr |
+
+Every level is moved by the same per-channel gain and the top of the range
+clips. With `--safe` the gain is followed by a soft knee that is the identity up
+to the knee and then approaches 255 asymptotically, so a specular highlight
+keeps its shape instead of blowing out to white. The knee is a fraction of the
+white point rather than of the range, so it follows the background: with the
+default of `0.5` the background itself lands just above the knee.
+
+Both rules are applied through one lookup curve per channel, which is forced to
+be monotone before it is used: a correction must never put a step in the output
+that was not in the input, and a curve written level by level can. Output levels
+are truncated rather than rounded.
+
+The library entry point is `adaptive_enhance_fusion::white_balance`.
 
 ## Limitations
 

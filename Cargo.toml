@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "iagcwd"
 path = "src/iagcwd_main.rs"
 
+[[bin]]
+name = "white-balance"
+path = "src/white_balance_main.rs"
+
 [dependencies]
 png = "0.17"
 
