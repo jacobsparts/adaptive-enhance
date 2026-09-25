@@ -9,11 +9,12 @@ The sibling [lightgpu inference engines](https://github.com/jacobsparts/lightgpu
 [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
 [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
 [locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
-[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) - share the
+[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs), and
+[nafnet-rs](https://github.com/jacobsparts/nafnet-rs) - share the
 [lightgpu](https://github.com/jacobsparts/lightgpu) CUDA toolkit. This toolset is
 CPU-only and does not use it.
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
-cleaning up product photos that drives this toolset and all four engines.
+cleaning up product photos that drives this toolset and all five engines.
 
 Three binaries are built:
 
