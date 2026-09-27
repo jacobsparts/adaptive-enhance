@@ -1,1 +1,7 @@
 /target
+
+# The lock IS tracked here, unlike the rest of the family: this crate has a
+# real dependency (the `png` crate) and the three binaries are the product,
+# so pinning the exact versions they were built and released with is the
+# point. It consumes no path or git dependency, so there is no reason for it
+# to move under the repository underneath it.
