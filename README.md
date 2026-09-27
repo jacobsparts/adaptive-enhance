@@ -8,10 +8,12 @@ and a Rust library for enhancing decoded RGB buffers or in-memory PNG data.
 The sibling [lightgpu inference engines](https://github.com/jacobsparts/lightgpu) -
 [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
 [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
-[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
+[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs),
 [lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs),
-[nafnet-rs](https://github.com/jacobsparts/nafnet-rs) and
-[maxim-rs](https://github.com/jacobsparts/maxim-rs) - share the
+[nafnet-rs](https://github.com/jacobsparts/nafnet-rs),
+[maxim-rs](https://github.com/jacobsparts/maxim-rs),
+[scunet-rs](https://github.com/jacobsparts/scunet-rs) and
+[ifan-rs](https://github.com/jacobsparts/ifan-rs) - share the
 [lightgpu](https://github.com/jacobsparts/lightgpu) CUDA toolkit. This toolset is
 CPU-only and does not use it.
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
