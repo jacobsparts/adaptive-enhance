@@ -6,18 +6,20 @@ that read PNG data from standard input and write PNG data to standard output,
 and a Rust library for enhancing decoded RGB buffers or in-memory PNG data.
 
 The sibling [lightgpu inference engines](https://github.com/jacobsparts/lightgpu) -
-[realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
-[rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
-[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs),
-[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs),
 [nafnet-rs](https://github.com/jacobsparts/nafnet-rs),
+[rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
 [maxim-rs](https://github.com/jacobsparts/maxim-rs),
-[scunet-rs](https://github.com/jacobsparts/scunet-rs) and
-[ifan-rs](https://github.com/jacobsparts/ifan-rs) - share the
-[lightgpu](https://github.com/jacobsparts/lightgpu) CUDA toolkit. This toolset is
-CPU-only and does not use it.
-[pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
-cleaning up product photos that drives this toolset and all five engines.
+[scunet-rs](https://github.com/jacobsparts/scunet-rs),
+[swin2sr-rs](https://github.com/jacobsparts/swin2sr-rs),
+[ifan-rs](https://github.com/jacobsparts/ifan-rs),
+[realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
+[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs),
+[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
+[nightenh-rs](https://github.com/jacobsparts/nightenh-rs) - share the
+[lightgpu](https://github.com/jacobsparts/lightgpu) CUDA
+toolkit. This toolset is CPU-only and does not use it;
+[pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for cleaning up
+product photos that drives them all.
 
 Three binaries are built:
 
